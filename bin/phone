@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# phone — manage Android emulators and iOS simulators from the terminal.
+# Compatible with macOS's stock bash 3.2.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+
+default_sdk() {
+  if [[ -d "$HOME/Library/Android/sdk" ]]; then echo "$HOME/Library/Android/sdk"
+  else echo "$HOME/Android/Sdk"; fi
+}
+
+SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$(default_sdk)}}"
+EMULATOR="$SDK/emulator/emulator"
+ADB="$SDK/platform-tools/adb"
+AVDMANAGER="$SDK/cmdline-tools/latest/bin/avdmanager"
+STUDIO_JDK="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+
+# Device lists are kept as parallel arrays: platform|id|label
+DEV_PLATFORM=()
+DEV_ID=()
+DEV_LABEL=()
+
+# ---------- output helpers ----------
+
+bold() { printf '\033[1m%s\033[0m' "$*"; }
+info() { printf '\033[36m›\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+$(bold phone) — Android emulators & iOS simulators
+
+Usage:
+  phone start [-c] [name]    Start an emulator/simulator (-c = cold boot, Android)
+  phone stop                 Stop a running device (picks if several are up)
+  phone restart [-c]         Restart a running device (picks if several are up)
+  phone create               Create a new Android emulator or iOS simulator
+  phone install <file.apk>   Install an APK on a running Android emulator
+  phone list                 Show all devices and which are running
+  phone -v | --version       Show the version
+  phone -h | help            Show this help
+EOF
+}
+
+# ---------- device discovery ----------
+
+reset_devices() { DEV_PLATFORM=(); DEV_ID=(); DEV_LABEL=(); }
+
+add_device() {
+  DEV_PLATFORM+=("$1"); DEV_ID+=("$2"); DEV_LABEL+=("$3")
+}
+
+# Prints "serial<TAB>avd_name" for each running Android emulator.
+running_android() {
+  [[ -x "$ADB" ]] || return 0
+  "$ADB" devices 2>/dev/null | awk '/^emulator-[0-9]+[[:space:]]+device/ {print $1}' |
+    while read -r serial; do
+      name=$("$ADB" -s "$serial" emu avd name 2>/dev/null | head -1 | tr -d '\r')
+      printf '%s\t%s\n' "$serial" "${name:-$serial}"
+    done
+}
+
+# Prints "udid<TAB>name (runtime)" for simulators in the given state (Booted/Shutdown).
+ios_by_state() {
+  command -v xcrun >/dev/null || return 0
+  xcrun simctl list devices available 2>/dev/null | awk -v state="$1" '
+    /^-- / { runtime = $0; gsub(/^-- | --$/, "", runtime); next }
+    $0 ~ "\\(" state "\\)" {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (match(line, /\([0-9A-F-]{36}\)/)) {
+        udid = substr(line, RSTART + 1, RLENGTH - 2)
+        name = substr(line, 1, RSTART - 2)
+        printf "%s\t%s (%s)\n", udid, name, runtime
+      }
+    }'
+}
+
+load_running() {
+  reset_devices
+  local id label
+  while IFS=$'\t' read -r id label; do
+    [[ -n "$id" ]] && add_device android "$id" "🤖 $label  [$id]"
+  done < <(running_android)
+  while IFS=$'\t' read -r id label; do
+    [[ -n "$id" ]] && add_device ios "$id" "🍎 $label"
+  done < <(ios_by_state Booted)
+}
+
+load_startable() {
+  reset_devices
+  local running_names avd id label
+  running_names=$(running_android | cut -f2)
+  if [[ -x "$EMULATOR" ]]; then
+    while read -r avd; do
+      [[ -z "$avd" ]] && continue
+      grep -qxF "$avd" <<<"$running_names" && continue
+      add_device android "$avd" "🤖 $avd"
+    done < <("$EMULATOR" -list-avds 2>/dev/null | grep -v '^INFO')
+  fi
+  while IFS=$'\t' read -r id label; do
+    [[ -n "$id" ]] && add_device ios "$id" "🍎 $label"
+  done < <(ios_by_state Shutdown)
+}
+
+# ---------- picker ----------
+
+# pick "prompt" item... → sets PICKED to the chosen index (0-based).
+# A single item is picked automatically.
+pick() {
+  local prompt="$1"; shift
+  local items=("$@") n=$# i choice
+  (( n == 0 )) && return 1
+  if (( n == 1 )); then PICKED=0; return 0; fi
+  echo "$prompt" >&2
+  for ((i = 0; i < n; i++)); do
+    printf '  %2d) %s\n' $((i + 1)) "${items[$i]}" >&2
+  done
+  while true; do
+    printf 'Choose [1-%d]: ' "$n" >&2
+    read -r choice </dev/tty || exit 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); then
+      PICKED=$((choice - 1)); return 0
+    fi
+    warn "Invalid choice."
+  done
+}
+
+pick_device() {
+  pick "$1" "${DEV_LABEL[@]}" || return 1
+  P_PLATFORM="${DEV_PLATFORM[$PICKED]}"
+  P_ID="${DEV_ID[$PICKED]}"
+  P_LABEL="${DEV_LABEL[$PICKED]}"
+}
+
+# ---------- start / stop ----------
+
+start_android() {
+  local avd="$1" cold="$2"
+  local args=(-avd "$avd")
+  [[ "$cold" == 1 ]] && args+=(-no-snapshot-load)
+  # New session so closing the terminal doesn't take the emulator down with it.
+  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' "$EMULATOR" "${args[@]}" </dev/null >/dev/null 2>&1 &
+  disown
+  ok "Starting $avd$([[ "$cold" == 1 ]] && echo ' (cold boot)')"
+}
+
+# Xcode ≤26 ships Simulator.app; Xcode 27 replaced it with DeviceHub.app.
+open_simulator_app() {
+  local dev apps app
+  dev=$(xcode-select -p 2>/dev/null)
+  apps="$dev/../Applications"
+  for app in "$apps/Simulator.app" "$dev/Applications/Simulator.app" "$apps/DeviceHub.app"; do
+    if [[ -d "$app" ]]; then open "$app"; return; fi
+  done
+  warn "Couldn't find Simulator.app or DeviceHub.app; the simulator is booted headless."
+}
+
+start_ios() {
+  local udid="$1" cold="$2"
+  [[ "$cold" == 1 ]] && info "Cold boot isn't a thing for iOS simulators; booting normally."
+  xcrun simctl boot "$udid" 2>/dev/null || true
+  open_simulator_app
+  ok "Booting simulator"
+}
+
+start_device() {
+  case "$1" in
+    android) start_android "$2" "$3" ;;
+    ios)     start_ios "$2" "$3" ;;
+  esac
+}
+
+stop_device() {
+  local platform="$1" id="$2"
+  case "$platform" in
+    android) "$ADB" -s "$id" emu kill >/dev/null 2>&1 ;;
+    ios)     xcrun simctl shutdown "$id" ;;
+  esac
+}
+
+wait_android_gone() {
+  local serial="$1" i
+  for ((i = 0; i < 30; i++)); do
+    "$ADB" devices 2>/dev/null | grep -q "^$serial[[:space:]]" || return 0
+    sleep 1
+  done
+  warn "$serial is taking a while to shut down."
+}
+
+# ---------- commands ----------
+
+cmd_start() {
+  local cold=0 name=""
+  while (( $# )); do
+    case "$1" in
+      -c|--cold) cold=1 ;;
+      -*) die "Unknown option: $1" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+
+  load_startable
+  (( ${#DEV_ID[@]} == 0 )) && die "Nothing to start: all devices are running, or none exist. Try: phone create"
+
+  if [[ -n "$name" ]]; then
+    local i matches=()
+    for ((i = 0; i < ${#DEV_ID[@]}; i++)); do
+      if [[ "${DEV_ID[$i]}" == "$name" ]] || grep -qiF -- "$name" <<<"${DEV_LABEL[$i]}"; then
+        matches+=("$i")
+      fi
+    done
+    if (( ${#matches[@]} == 0 )); then
+      load_running
+      for ((i = 0; i < ${#DEV_ID[@]}; i++)); do
+        grep -qiF -- "$name" <<<"${DEV_LABEL[$i]}" && die "Already running: ${DEV_LABEL[$i]}"
+      done
+      die "No device matches '$name'. See: phone list"
+    fi
+    local labels=() m
+    for m in "${matches[@]}"; do labels+=("${DEV_LABEL[$m]}"); done
+    pick "Several devices match '$name':" "${labels[@]}"
+    local idx="${matches[$PICKED]}"
+    start_device "${DEV_PLATFORM[$idx]}" "${DEV_ID[$idx]}" "$cold"
+    return
+  fi
+
+  pick_device "Which device do you want to start?"
+  start_device "$P_PLATFORM" "$P_ID" "$cold"
+}
+
+cmd_stop() {
+  load_running
+  (( ${#DEV_ID[@]} == 0 )) && die "No emulators or simulators are running."
+
+  if (( ${#DEV_ID[@]} > 1 )); then
+    local labels=("${DEV_LABEL[@]}" "All of them")
+    pick "Several devices are running. Which one should stop?" "${labels[@]}"
+    if (( PICKED == ${#DEV_ID[@]} )); then
+      local i
+      for ((i = 0; i < ${#DEV_ID[@]}; i++)); do
+        stop_device "${DEV_PLATFORM[$i]}" "${DEV_ID[$i]}" && ok "Stopped ${DEV_LABEL[$i]}"
+      done
+      return
+    fi
+  else
+    PICKED=0
+  fi
+
+  stop_device "${DEV_PLATFORM[$PICKED]}" "${DEV_ID[$PICKED]}" && ok "Stopped ${DEV_LABEL[$PICKED]}"
+}
+
+cmd_restart() {
+  local cold=0
+  [[ "${1:-}" == "-c" || "${1:-}" == "--cold" ]] && cold=1
+
+  load_running
+  (( ${#DEV_ID[@]} == 0 )) && die "No emulators or simulators are running. Use: phone start"
+  pick_device "Several devices are running. Which one should restart?"
+
+  info "Restarting $P_LABEL"
+  if [[ "$P_PLATFORM" == android ]]; then
+    local avd
+    avd=$("$ADB" -s "$P_ID" emu avd name 2>/dev/null | head -1 | tr -d '\r')
+    [[ -z "$avd" ]] && die "Couldn't read the AVD name for $P_ID."
+    stop_device android "$P_ID"
+    wait_android_gone "$P_ID"
+    start_android "$avd" "$cold"
+  else
+    stop_device ios "$P_ID"
+    start_ios "$P_ID" "$cold"
+  fi
+}
+
+cmd_install() {
+  local apk="${1:-}"
+  [[ -z "$apk" ]] && die "Usage: phone install <path/to/app.apk>"
+  apk="${apk/#\~/$HOME}"
+  [[ -f "$apk" ]] || die "File not found: $apk"
+  [[ "$apk" == *.apk ]] || die "Not an .apk file: $apk"
+
+  reset_devices
+  local id label
+  while IFS=$'\t' read -r id label; do
+    [[ -n "$id" ]] && add_device android "$id" "🤖 $label  [$id]"
+  done < <(running_android)
+  (( ${#DEV_ID[@]} == 0 )) && die "No Android emulator is running. Use: phone start"
+
+  pick_device "Several emulators are running. Install on which one?"
+  info "Installing $(basename "$apk") on $P_LABEL"
+  "$ADB" -s "$P_ID" install -r "$apk" && ok "Installed"
+}
+
+cmd_list() {
+  load_running
+  echo "$(bold Running)"
+  if (( ${#DEV_ID[@]} == 0 )); then echo "  (none)"; else printf '  %s\n' "${DEV_LABEL[@]}"; fi
+  load_startable
+  echo "$(bold Stopped)"
+  if (( ${#DEV_ID[@]} == 0 )); then echo "  (none)"; else printf '  %s\n' "${DEV_LABEL[@]}"; fi
+}
+
+# ---------- create ----------
+
+ask() {
+  local prompt="$1" default="$2" answer
+  printf '%s [%s]: ' "$prompt" "$default" >&2
+  read -r answer </dev/tty || exit 1
+  echo "${answer:-$default}"
+}
+
+avdmanager() {
+  [[ -x "$AVDMANAGER" ]] || die "avdmanager not found. Install 'Android SDK Command-line Tools' from Android Studio."
+  if [[ -d "$STUDIO_JDK" ]]; then
+    JAVA_HOME="$STUDIO_JDK" "$AVDMANAGER" "$@"
+  else
+    "$AVDMANAGER" "$@"
+  fi
+}
+
+create_android() {
+  # Installed system images, e.g. system-images;android-33;google_apis_playstore;arm64-v8a
+  local images=() dir
+  for dir in "$SDK"/system-images/*/*/*/; do
+    [[ -d "$dir" ]] || continue
+    dir="${dir%/}"
+    dir="${dir#"$SDK"/}"
+    images+=("${dir//\//;}")
+  done
+  (( ${#images[@]} == 0 )) && die "No system images installed. Download one from Android Studio's SDK Manager."
+
+  pick "Which system image?" "${images[@]}"
+  local image="${images[$PICKED]}"
+
+  local all_profiles profiles=() p
+  all_profiles=$(avdmanager list device -c 2>/dev/null | grep -v 'integer expression')
+  for p in pixel_9_pro pixel_9 pixel_8 pixel_7 pixel_5 medium_phone small_phone pixel_tablet medium_tablet; do
+    grep -qxF "$p" <<<"$all_profiles" && profiles+=("$p")
+  done
+  (( ${#profiles[@]} == 0 )) && die "Couldn't load device profiles from avdmanager."
+
+  pick "Which device profile?" "${profiles[@]}"
+  local profile="${profiles[$PICKED]}"
+
+  local api="${image#*;}"; api="${api%%;*}"
+  local name
+  name=$(ask "Name" "${profile}_${api//-/_}")
+  name="${name// /_}"
+
+  info "Creating $name ($profile, $image)"
+  echo no | avdmanager create avd -n "$name" -k "$image" -d "$profile" >/dev/null ||
+    die "avdmanager failed."
+  ok "Created $name — start it with: phone start $name"
+}
+
+create_ios() {
+  command -v xcrun >/dev/null || die "Xcode isn't installed."
+
+  local runtimes=() runtime_ids=() id name
+  while IFS=$'\t' read -r id name; do
+    runtime_ids+=("$id"); runtimes+=("$name")
+  done < <(xcrun simctl list -j runtimes | python3 -c '
+import json, sys
+for r in json.load(sys.stdin)["runtimes"]:
+    if r.get("isAvailable"):
+        print(r["identifier"] + "\t" + r["name"])')
+  (( ${#runtimes[@]} == 0 )) && die "No iOS runtimes installed. Add one in Xcode → Settings → Components."
+
+  pick "Which runtime?" "${runtimes[@]}"
+  local runtime="${runtime_ids[$PICKED]}"
+
+  local types=() type_ids=()
+  while IFS=$'\t' read -r id name; do
+    type_ids+=("$id"); types+=("$name")
+  done < <(xcrun simctl list -j runtimes | python3 -c '
+import json, sys
+rid = sys.argv[1]
+for r in json.load(sys.stdin)["runtimes"]:
+    if r["identifier"] == rid:
+        for t in r.get("supportedDeviceTypes", []):
+            if t.get("productFamily") in ("iPhone", "iPad"):
+                print(t["identifier"] + "\t" + t["name"])' "$runtime")
+  (( ${#types[@]} == 0 )) && die "No device types available for that runtime."
+
+  pick "Which device?" "${types[@]}"
+  local type="${type_ids[$PICKED]}" type_name="${types[$PICKED]}"
+
+  name=$(ask "Name" "$type_name")
+  local udid
+  udid=$(xcrun simctl create "$name" "$type" "$runtime") || die "simctl create failed."
+  ok "Created $name ($udid) — start it with: phone start \"$name\""
+}
+
+cmd_create() {
+  pick "Which platform?" "Android" "iOS"
+  case "$PICKED" in
+    0) create_android ;;
+    1) create_ios ;;
+  esac
+}
+
+# ---------- main ----------
+
+case "${1:-}" in
+  start)            shift; cmd_start "$@" ;;
+  stop)             shift; cmd_stop ;;
+  restart)          shift; cmd_restart "$@" ;;
+  create)           shift; cmd_create ;;
+  install)          shift; cmd_install "$@" ;;
+  list|ls)          cmd_list ;;
+  -v|--version)     echo "phone $VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *)                warn "Unknown command: $1"; usage; exit 1 ;;
+esac

@@ -1,0 +1,15 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install shellcheck
+      - run: shellcheck bin/phone install.sh
+      - run: /bin/bash -n bin/phone   # stock macOS bash 3.2
+      - run: ./bin/phone --version
