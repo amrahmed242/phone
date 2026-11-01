@@ -186,7 +186,7 @@ stop_device() {
 wait_android_gone() {
   local serial="$1" i
   for ((i = 0; i < 30; i++)); do
-    "$ADB" devices 2>/dev/null | grep -q "^$serial[[:space:]]" || return 0
+    "$ADB" devices 2>/dev/null | grep -q "^${serial}[[:space:]]" || return 0
     sleep 1
   done
   warn "$serial is taking a while to shut down."
@@ -298,10 +298,10 @@ cmd_install() {
 
 cmd_list() {
   load_running
-  echo "$(bold Running)"
+  bold Running; echo
   if (( ${#DEV_ID[@]} == 0 )); then echo "  (none)"; else printf '  %s\n' "${DEV_LABEL[@]}"; fi
   load_startable
-  echo "$(bold Stopped)"
+  bold Stopped; echo
   if (( ${#DEV_ID[@]} == 0 )); then echo "  (none)"; else printf '  %s\n' "${DEV_LABEL[@]}"; fi
 }
 
