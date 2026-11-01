@@ -348,11 +348,13 @@ start_device() {
 }
 
 stop_device() {
-  local platform="$1" id="$2" label="$3"
+  local platform="$1" id="$2" label="$3" status
   case "$platform" in
     android) "$ADB" -s "$id" emu kill >/dev/null 2>&1 ;;
     ios)     xcrun simctl shutdown "$id" 2>/dev/null ;;
-  esac && ok "Stopped $label" || warn "Couldn't stop $label"
+  esac
+  status=$?
+  if (( status == 0 )); then ok "Stopped $label"; else warn "Couldn't stop $label"; fi
 }
 
 wait_android_gone() {
