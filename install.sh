@@ -26,7 +26,11 @@ fi
 
 mkdir -p "$BIN_DIR"
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+# Only a script run from a file has a real path; `curl … | bash` doesn't.
+script_dir=""
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 if [[ -n "$script_dir" && -f "$script_dir/bin/phone" ]]; then
   ln -sf "$script_dir/bin/phone" "$TARGET"
   ok "Linked $TARGET → $script_dir/bin/phone"
