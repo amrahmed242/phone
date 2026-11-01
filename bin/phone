@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# phone — manage Android emulators and iOS simulators from the terminal.
-# Compatible with macOS's stock bash 3.2.
+# phone — manage Android emulators, iOS simulators and real devices from the terminal.
+# Compatible with macOS's stock bash 3.2: no associative arrays, no mapfile, and
+# possibly-empty arrays are expanded as ${arr[@]+"${arr[@]}"} because of `set -u`.
 
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 default_sdk() {
   if [[ -d "$HOME/Library/Android/sdk" ]]; then echo "$HOME/Library/Android/sdk"
   else echo "$HOME/Android/Sdk"; fi
+}
+
+default_log_dir() {
+  if [[ -d "$HOME/Library/Logs" ]]; then echo "$HOME/Library/Logs/phone"
+  else echo "${XDG_STATE_HOME:-$HOME/.local/state}/phone"; fi
 }
 
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$(default_sdk)}}"
@@ -16,55 +22,159 @@ EMULATOR="$SDK/emulator/emulator"
 ADB="$SDK/platform-tools/adb"
 AVDMANAGER="$SDK/cmdline-tools/latest/bin/avdmanager"
 STUDIO_JDK="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+LOG_DIR="${PHONE_LOG_DIR:-$(default_log_dir)}"
+BOOT_TIMEOUT="${PHONE_BOOT_TIMEOUT:-300}"
 
-# Device lists are kept as parallel arrays: platform|id|label
-DEV_PLATFORM=()
-DEV_ID=()
-DEV_LABEL=()
+# Device lists are kept as parallel arrays.
+DEV_PLATFORM=()   # android | ios
+DEV_ID=()         # adb serial, AVD name or simulator UDID
+DEV_NAME=()       # human name used for matching
+DEV_LABEL=()      # what the picker shows
 
-# ---------- output helpers ----------
+# ---------- output ----------
 
-bold() { printf '\033[1m%s\033[0m' "$*"; }
-info() { printf '\033[36m›\033[0m %s\n' "$*"; }
-ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+use_color() { [[ -z "${NO_COLOR:-}" && -t "$1" ]]; }
+if use_color 1; then B=$'\033[1m'; D=$'\033[2m'; CY=$'\033[36m'; GR=$'\033[32m'; R0=$'\033[0m'
+else B=""; D=""; CY=""; GR=""; R0=""; fi
+if use_color 2; then YE=$'\033[33m'; RE=$'\033[31m'; E0=$'\033[0m'
+else YE=""; RE=""; E0=""; fi
+
+bold() { printf '%s%s%s' "$B" "$*" "$R0"; }
+info() { printf '%s›%s %s\n' "$CY" "$R0" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GR" "$R0" "$*"; }
+warn() { printf '%s!%s %s\n' "$YE" "$E0" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$RE" "$E0" "$*" >&2; exit 1; }
+
+# One-line, self-overwriting progress on stderr (only when it's a terminal).
+progress() { [[ -t 2 ]] && printf '\r\033[K%s %s(%ss)%s' "$1" "$D" "$2" "$R0" >&2; return 0; }
+progress_done() { [[ -t 2 ]] && printf '\r\033[K' >&2; return 0; }
 
 usage() {
   cat <<EOF
-$(bold phone) — Android emulators & iOS simulators
+$(bold phone) $VERSION — Android emulators, iOS simulators and real devices
 
-Usage:
-  phone start [-c] [name]    Start an emulator/simulator (-c = cold boot, Android)
-  phone stop                 Stop a running device (picks if several are up)
-  phone restart [-c]         Restart a running device (picks if several are up)
-  phone create               Create a new Android emulator or iOS simulator
-  phone install <file.apk>   Install an APK on a running Android emulator
-  phone list                 Show all devices and which are running
-  phone -v | --version       Show the version
-  phone -h | help            Show this help
+$(bold USAGE)
+  phone <command> [options]
+
+$(bold COMMANDS)
+  start   [name] [-c] [-w]     Start a stopped emulator/simulator
+  stop    [name] [-a]          Stop a running emulator/simulator
+  restart [name] [-c] [-w]     Restart a running emulator/simulator
+  create                       Create a new Android emulator or iOS simulator
+  install <file.apk> [name]    Install an APK on a running emulator or connected phone
+  cast    [name] [options]     Mirror a real device's screen (Android via scrcpy)
+  list                         Show running and stopped devices
+
+$(bold OPTIONS)
+  -c, --cold                   Cold boot, skipping the snapshot (Android)
+  -w, --wait                   Return only once the device has finished booting
+  -a, --all                    Stop every running device
+
+$(bold CAST OPTIONS)
+  -w, --wireless               Switch to Wi-Fi so the cable can be unplugged
+  -r, --record [file]          Record to an .mp4 (default: ~/Desktop)
+      --off                    Turn the phone's screen off while mirroring
+      --awake                  Keep the phone awake while mirroring
+      --view-only              Mirror without forwarding mouse/keyboard
+  -m, --max-size <px>          Limit the mirrored resolution
+      --emulators              Include emulators in the device list
+      --ios                    Open QuickTime to mirror a connected iPhone
+  --  <args>                   Pass the remaining arguments to scrcpy
+
+$(bold GLOBAL)
+  -h, --help                   Show this help
+  -v, --version                Show the version
+
+When only one device fits, phone picks it; otherwise it asks. [name] matches the
+device name (exact match first, then any part of it, case-insensitive).
+
+Logs: $LOG_DIR
 EOF
+}
+
+# ---------- small helpers ----------
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+has_tty() { [[ -t 0 ]] || { : </dev/tty; } 2>/dev/null; }
+
+ask() {
+  local prompt="$1" default="$2" answer
+  printf '%s [%s]: ' "$prompt" "$default" >&2
+  read -r answer </dev/tty || exit 1
+  echo "${answer:-$default}"
+}
+
+confirm() {
+  local answer
+  has_tty || return 1
+  printf '%s [Y/n]: ' "$1" >&2
+  read -r answer </dev/tty || return 1
+  [[ -z "$answer" || "$answer" == [yY]* ]]
+}
+
+require_adb() {
+  [[ -x "$ADB" ]] || die "adb not found in $SDK/platform-tools. Set ANDROID_HOME to your Android SDK."
+}
+
+# Runs a command in its own session (so closing the terminal doesn't kill it), logging
+# to $LOG_DIR/<name>.log. Fails with the log tail if it dies straight away.
+# Sets LAUNCHED_PID and LAUNCHED_LOG.
+launch_detached() {
+  local name="$1"; shift
+  mkdir -p "$LOG_DIR"
+  LAUNCHED_LOG="$LOG_DIR/$name.log"
+  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' "$@" </dev/null >"$LAUNCHED_LOG" 2>&1 &
+  LAUNCHED_PID=$!
+  disown
+  sleep 2
+  if ! kill -0 "$LAUNCHED_PID" 2>/dev/null; then
+    warn "$name exited right away. Last lines of $LAUNCHED_LOG:"
+    tail -n 15 "$LAUNCHED_LOG" >&2
+    exit 1
+  fi
 }
 
 # ---------- device discovery ----------
 
-reset_devices() { DEV_PLATFORM=(); DEV_ID=(); DEV_LABEL=(); }
+reset_devices() { DEV_PLATFORM=(); DEV_ID=(); DEV_NAME=(); DEV_LABEL=(); }
 
 add_device() {
-  DEV_PLATFORM+=("$1"); DEV_ID+=("$2"); DEV_LABEL+=("$3")
+  DEV_PLATFORM+=("$1"); DEV_ID+=("$2"); DEV_NAME+=("$3"); DEV_LABEL+=("$4")
 }
 
-# Prints "serial<TAB>avd_name" for each running Android emulator.
-running_android() {
+device_count() { echo "${#DEV_ID[@]}"; }
+
+# Prints "serial<TAB>name<TAB>kind" for adb devices that are online.
+# filter: emulator | physical | all
+android_devices() {
+  local filter="$1" serial name kind
   [[ -x "$ADB" ]] || return 0
-  "$ADB" devices 2>/dev/null | awk '/^emulator-[0-9]+[[:space:]]+device/ {print $1}' |
+  "$ADB" devices 2>/dev/null | awk 'NR > 1 && $2 == "device" {print $1}' |
     while read -r serial; do
-      name=$("$ADB" -s "$serial" emu avd name 2>/dev/null | head -1 | tr -d '\r')
-      printf '%s\t%s\n' "$serial" "${name:-$serial}"
+      if [[ "$serial" == emulator-* ]]; then
+        [[ "$filter" == physical ]] && continue
+        kind=emulator
+        name=$("$ADB" -s "$serial" emu avd name </dev/null 2>/dev/null | head -1 | tr -d '\r')
+      else
+        [[ "$filter" == emulator ]] && continue
+        kind=physical
+        name=$("$ADB" -s "$serial" shell getprop ro.product.model </dev/null 2>/dev/null | tr -d '\r')
+      fi
+      printf '%s\t%s\t%s\n' "$serial" "${name:-$serial}" "$kind"
     done
 }
 
-# Prints "udid<TAB>name (runtime)" for simulators in the given state (Booted/Shutdown).
+load_android() {
+  local serial name kind icon
+  while IFS=$'\t' read -r serial name kind; do
+    [[ -z "$serial" ]] && continue
+    if [[ "$kind" == emulator ]]; then icon="🤖"; else icon="📱"; fi
+    add_device android "$serial" "$name" "$icon $name  [$serial]"
+  done < <(android_devices "$1")
+}
+
+# Prints "udid<TAB>name<TAB>runtime" for simulators in the given state (Booted/Shutdown).
 ios_by_state() {
   command -v xcrun >/dev/null || return 0
   xcrun simctl list devices available 2>/dev/null | awk -v state="$1" '
@@ -75,39 +185,39 @@ ios_by_state() {
       if (match(line, /\([0-9A-F-]{36}\)/)) {
         udid = substr(line, RSTART + 1, RLENGTH - 2)
         name = substr(line, 1, RSTART - 2)
-        printf "%s\t%s (%s)\n", udid, name, runtime
+        printf "%s\t%s\t%s\n", udid, name, runtime
       }
     }'
 }
 
+load_ios() {
+  local udid name runtime
+  while IFS=$'\t' read -r udid name runtime; do
+    [[ -n "$udid" ]] && add_device ios "$udid" "$name" "🍎 $name ($runtime)"
+  done < <(ios_by_state "$1")
+}
+
 load_running() {
   reset_devices
-  local id label
-  while IFS=$'\t' read -r id label; do
-    [[ -n "$id" ]] && add_device android "$id" "🤖 $label  [$id]"
-  done < <(running_android)
-  while IFS=$'\t' read -r id label; do
-    [[ -n "$id" ]] && add_device ios "$id" "🍎 $label"
-  done < <(ios_by_state Booted)
+  load_android emulator
+  load_ios Booted
 }
 
 load_startable() {
   reset_devices
-  local running_names avd id label
-  running_names=$(running_android | cut -f2)
+  local running avd
+  running=$(android_devices emulator | cut -f2)
   if [[ -x "$EMULATOR" ]]; then
     while read -r avd; do
       [[ -z "$avd" ]] && continue
-      grep -qxF "$avd" <<<"$running_names" && continue
-      add_device android "$avd" "🤖 $avd"
+      grep -qxF "$avd" <<<"$running" && continue
+      add_device android "$avd" "$avd" "🤖 $avd"
     done < <("$EMULATOR" -list-avds 2>/dev/null | grep -v '^INFO')
   fi
-  while IFS=$'\t' read -r id label; do
-    [[ -n "$id" ]] && add_device ios "$id" "🍎 $label"
-  done < <(ios_by_state Shutdown)
+  load_ios Shutdown
 }
 
-# ---------- picker ----------
+# ---------- picking ----------
 
 # pick "prompt" item... → sets PICKED to the chosen index (0-based).
 # A single item is picked automatically.
@@ -116,6 +226,7 @@ pick() {
   local items=("$@") n=$# i choice
   (( n == 0 )) && return 1
   if (( n == 1 )); then PICKED=0; return 0; fi
+  has_tty || die "Several devices fit and there is no terminal to choose in. Pass a more specific name (see: phone list)."
   echo "$prompt" >&2
   for ((i = 0; i < n; i++)); do
     printf '  %2d) %s\n' $((i + 1)) "${items[$i]}" >&2
@@ -130,23 +241,79 @@ pick() {
   done
 }
 
-pick_device() {
-  pick "$1" "${DEV_LABEL[@]}" || return 1
-  P_PLATFORM="${DEV_PLATFORM[$PICKED]}"
-  P_ID="${DEV_ID[$PICKED]}"
-  P_LABEL="${DEV_LABEL[$PICKED]}"
+set_picked() {
+  P_PLATFORM="${DEV_PLATFORM[$1]}"
+  P_ID="${DEV_ID[$1]}"
+  P_NAME="${DEV_NAME[$1]}"
+  P_LABEL="${DEV_LABEL[$1]}"
+}
+
+# match_device <name> → picks among the loaded devices whose id/name matches.
+# Exact matches win over partial ones. Returns 1 when nothing matches.
+match_device() {
+  local want i n hits=() exact=() labels=() h
+  want=$(lower "$1")
+  n=$(device_count)
+  for ((i = 0; i < n; i++)); do
+    if [[ "$(lower "${DEV_ID[$i]}")" == "$want" || "$(lower "${DEV_NAME[$i]}")" == "$want" ]]; then
+      exact+=("$i")
+    elif grep -qiF -- "$1" <<<"${DEV_LABEL[$i]}"; then
+      hits+=("$i")
+    fi
+  done
+  (( ${#exact[@]} > 0 )) && hits=("${exact[@]}")
+  (( ${#hits[@]} == 0 )) && return 1
+  for h in "${hits[@]}"; do labels+=("${DEV_LABEL[$h]}"); done
+  pick "Several devices match '$1':" "${labels[@]}"
+  set_picked "${hits[$PICKED]}"
+}
+
+# select_device <name-or-empty> <prompt> → sets P_*; dies when a name matches nothing.
+select_device() {
+  if [[ -n "$1" ]]; then
+    match_device "$1" || die "No device matches '$1'. See: phone list"
+  else
+    pick "$2" "${DEV_LABEL[@]}"
+    set_picked "$PICKED"
+  fi
 }
 
 # ---------- start / stop ----------
 
 start_android() {
-  local avd="$1" cold="$2"
+  local avd="$1" cold="$2" wait="$3"
   local args=(-avd "$avd")
   [[ "$cold" == 1 ]] && args+=(-no-snapshot-load)
-  # New session so closing the terminal doesn't take the emulator down with it.
-  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' "$EMULATOR" "${args[@]}" </dev/null >/dev/null 2>&1 &
-  disown
+  launch_detached "emulator-$avd" "$EMULATOR" "${args[@]}"
   ok "Starting $avd$([[ "$cold" == 1 ]] && echo ' (cold boot)')"
+  if [[ "$wait" == 1 ]]; then wait_android_boot "$avd" "$LAUNCHED_PID"; fi
+}
+
+wait_android_boot() {
+  local avd="$1" pid="$2" start=$SECONDS serial="" booted
+  while (( SECONDS - start < BOOT_TIMEOUT )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      progress_done
+      warn "The emulator exited while booting. Last lines of $LAUNCHED_LOG:"
+      tail -n 15 "$LAUNCHED_LOG" >&2
+      exit 1
+    fi
+    if [[ -z "$serial" ]]; then
+      serial=$(android_devices emulator | awk -F'\t' -v n="$avd" '$2 == n {print $1; exit}')
+    fi
+    if [[ -n "$serial" ]]; then
+      booted=$("$ADB" -s "$serial" shell getprop sys.boot_completed </dev/null 2>/dev/null | tr -d '\r')
+      if [[ "$booted" == 1 ]]; then
+        progress_done
+        ok "$avd is ready ($((SECONDS - start))s)"
+        return 0
+      fi
+    fi
+    progress "Waiting for $avd to boot" $((SECONDS - start))
+    sleep 2
+  done
+  progress_done
+  die "$avd didn't finish booting within ${BOOT_TIMEOUT}s. Log: $LAUNCHED_LOG"
 }
 
 # Xcode ≤26 ships Simulator.app; Xcode 27 replaced it with DeviceHub.app.
@@ -157,30 +324,35 @@ open_simulator_app() {
   for app in "$apps/Simulator.app" "$dev/Applications/Simulator.app" "$apps/DeviceHub.app"; do
     if [[ -d "$app" ]]; then open "$app"; return; fi
   done
-  warn "Couldn't find Simulator.app or DeviceHub.app; the simulator is booted headless."
+  warn "Couldn't find Simulator.app or DeviceHub.app; the simulator is running headless."
 }
 
 start_ios() {
-  local udid="$1" cold="$2"
-  [[ "$cold" == 1 ]] && info "Cold boot isn't a thing for iOS simulators; booting normally."
+  local udid="$1" cold="$2" wait="$3"
+  [[ "$cold" == 1 ]] && info "iOS simulators have no cold boot; booting normally."
   xcrun simctl boot "$udid" 2>/dev/null || true
   open_simulator_app
   ok "Booting simulator"
+  if [[ "$wait" == 1 ]]; then
+    info "Waiting for the simulator to boot…"
+    xcrun simctl bootstatus "$udid" >/dev/null 2>&1 || die "The simulator failed to boot."
+    ok "Simulator is ready"
+  fi
 }
 
 start_device() {
   case "$1" in
-    android) start_android "$2" "$3" ;;
-    ios)     start_ios "$2" "$3" ;;
+    android) start_android "$2" "$3" "$4" ;;
+    ios)     start_ios "$2" "$3" "$4" ;;
   esac
 }
 
 stop_device() {
-  local platform="$1" id="$2"
+  local platform="$1" id="$2" label="$3"
   case "$platform" in
     android) "$ADB" -s "$id" emu kill >/dev/null 2>&1 ;;
-    ios)     xcrun simctl shutdown "$id" ;;
-  esac
+    ios)     xcrun simctl shutdown "$id" 2>/dev/null ;;
+  esac && ok "Stopped $label" || warn "Couldn't stop $label"
 }
 
 wait_android_gone() {
@@ -194,167 +366,289 @@ wait_android_gone() {
 
 # ---------- commands ----------
 
-cmd_start() {
-  local cold=0 name=""
+# Shared by start and restart: sets OPT_COLD, OPT_WAIT and OPT_NAME.
+parse_boot_opts() {
+  OPT_COLD=0; OPT_WAIT=0; OPT_NAME=""
   while (( $# )); do
     case "$1" in
-      -c|--cold) cold=1 ;;
+      -c|--cold) OPT_COLD=1 ;;
+      -w|--wait) OPT_WAIT=1 ;;
+      -h|--help) usage; exit 0 ;;
       -*) die "Unknown option: $1" ;;
-      *) name="$1" ;;
+      *) [[ -n "$OPT_NAME" ]] && die "Unexpected argument: $1"; OPT_NAME="$1" ;;
+    esac
+    shift
+  done
+}
+
+cmd_start() {
+  parse_boot_opts "$@"
+  load_startable
+
+  if [[ -n "$OPT_NAME" ]] && ! match_device "$OPT_NAME"; then
+    load_running
+    match_device "$OPT_NAME" && die "Already running: $P_LABEL"
+    die "No device matches '$OPT_NAME'. See: phone list"
+  fi
+  if [[ -z "$OPT_NAME" ]]; then
+    (( $(device_count) == 0 )) && die "Nothing to start: every device is running, or none exist. Try: phone create"
+    select_device "" "Which device do you want to start?"
+  fi
+  start_device "$P_PLATFORM" "$P_ID" "$OPT_COLD" "$OPT_WAIT"
+}
+
+cmd_stop() {
+  local all=0 name="" i n
+  while (( $# )); do
+    case "$1" in
+      -a|--all) all=1 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown option: $1" ;;
+      *) [[ -n "$name" ]] && die "Unexpected argument: $1"; name="$1" ;;
     esac
     shift
   done
 
-  load_startable
-  (( ${#DEV_ID[@]} == 0 )) && die "Nothing to start: all devices are running, or none exist. Try: phone create"
+  load_running
+  n=$(device_count)
+  (( n == 0 )) && die "No emulators or simulators are running."
 
-  if [[ -n "$name" ]]; then
-    local i matches=()
-    for ((i = 0; i < ${#DEV_ID[@]}; i++)); do
-      if [[ "${DEV_ID[$i]}" == "$name" ]] || grep -qiF -- "$name" <<<"${DEV_LABEL[$i]}"; then
-        matches+=("$i")
-      fi
-    done
-    if (( ${#matches[@]} == 0 )); then
-      load_running
-      for ((i = 0; i < ${#DEV_ID[@]}; i++)); do
-        grep -qiF -- "$name" <<<"${DEV_LABEL[$i]}" && die "Already running: ${DEV_LABEL[$i]}"
-      done
-      die "No device matches '$name'. See: phone list"
-    fi
-    local labels=() m
-    for m in "${matches[@]}"; do labels+=("${DEV_LABEL[$m]}"); done
-    pick "Several devices match '$name':" "${labels[@]}"
-    local idx="${matches[$PICKED]}"
-    start_device "${DEV_PLATFORM[$idx]}" "${DEV_ID[$idx]}" "$cold"
+  if (( all == 0 )) && [[ -z "$name" ]] && (( n > 1 )); then
+    pick "Several devices are running. Which one should stop?" "${DEV_LABEL[@]}" "All of them"
+    (( PICKED == n )) && all=1
+  fi
+
+  if (( all == 1 )); then
+    for ((i = 0; i < n; i++)); do stop_device "${DEV_PLATFORM[$i]}" "${DEV_ID[$i]}" "${DEV_LABEL[$i]}"; done
     return
   fi
 
-  pick_device "Which device do you want to start?"
-  start_device "$P_PLATFORM" "$P_ID" "$cold"
-}
-
-cmd_stop() {
-  load_running
-  (( ${#DEV_ID[@]} == 0 )) && die "No emulators or simulators are running."
-
-  if (( ${#DEV_ID[@]} > 1 )); then
-    local labels=("${DEV_LABEL[@]}" "All of them")
-    pick "Several devices are running. Which one should stop?" "${labels[@]}"
-    if (( PICKED == ${#DEV_ID[@]} )); then
-      local i
-      for ((i = 0; i < ${#DEV_ID[@]}; i++)); do
-        stop_device "${DEV_PLATFORM[$i]}" "${DEV_ID[$i]}" && ok "Stopped ${DEV_LABEL[$i]}"
-      done
-      return
-    fi
-  else
-    PICKED=0
-  fi
-
-  stop_device "${DEV_PLATFORM[$PICKED]}" "${DEV_ID[$PICKED]}" && ok "Stopped ${DEV_LABEL[$PICKED]}"
+  if [[ -n "$name" ]]; then select_device "$name" ""; else set_picked "${PICKED:-0}"; fi
+  stop_device "$P_PLATFORM" "$P_ID" "$P_LABEL"
 }
 
 cmd_restart() {
-  local cold=0
-  [[ "${1:-}" == "-c" || "${1:-}" == "--cold" ]] && cold=1
-
+  parse_boot_opts "$@"
   load_running
-  (( ${#DEV_ID[@]} == 0 )) && die "No emulators or simulators are running. Use: phone start"
-  pick_device "Several devices are running. Which one should restart?"
+  (( $(device_count) == 0 )) && die "No emulators or simulators are running. Use: phone start"
+  select_device "$OPT_NAME" "Several devices are running. Which one should restart?"
 
   info "Restarting $P_LABEL"
   if [[ "$P_PLATFORM" == android ]]; then
-    local avd
-    avd=$("$ADB" -s "$P_ID" emu avd name 2>/dev/null | head -1 | tr -d '\r')
-    [[ -z "$avd" ]] && die "Couldn't read the AVD name for $P_ID."
-    stop_device android "$P_ID"
+    stop_device android "$P_ID" "$P_LABEL"
     wait_android_gone "$P_ID"
-    start_android "$avd" "$cold"
+    start_android "$P_NAME" "$OPT_COLD" "$OPT_WAIT"
   else
-    stop_device ios "$P_ID"
-    start_ios "$P_ID" "$cold"
+    stop_device ios "$P_ID" "$P_LABEL"
+    start_ios "$P_ID" "$OPT_COLD" "$OPT_WAIT"
   fi
 }
 
 cmd_install() {
-  local apk="${1:-}"
-  [[ -z "$apk" ]] && die "Usage: phone install <path/to/app.apk>"
+  local apk="" name=""
+  while (( $# )); do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown option: $1" ;;
+      *) if [[ -z "$apk" ]]; then apk="$1"; elif [[ -z "$name" ]]; then name="$1"; else die "Unexpected argument: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -z "$apk" ]] && die "Usage: phone install <path/to/app.apk> [device]"
   apk="${apk/#\~/$HOME}"
   [[ -f "$apk" ]] || die "File not found: $apk"
   [[ "$apk" == *.apk ]] || die "Not an .apk file: $apk"
+  require_adb
 
   reset_devices
-  local id label
-  while IFS=$'\t' read -r id label; do
-    [[ -n "$id" ]] && add_device android "$id" "🤖 $label  [$id]"
-  done < <(running_android)
-  (( ${#DEV_ID[@]} == 0 )) && die "No Android emulator is running. Use: phone start"
+  load_android all
+  (( $(device_count) == 0 )) && die "No Android emulator or phone is connected. Use: phone start"
+  select_device "$name" "Several Android devices are connected. Install on which one?"
 
-  pick_device "Several emulators are running. Install on which one?"
   info "Installing $(basename "$apk") on $P_LABEL"
   "$ADB" -s "$P_ID" install -r "$apk" && ok "Installed"
 }
 
+print_section() {
+  bold "$1"; echo
+  if (( $(device_count) == 0 )); then echo "  (none)"; else printf '  %s\n' "${DEV_LABEL[@]}"; fi
+}
+
 cmd_list() {
   load_running
-  bold Running; echo
-  if (( ${#DEV_ID[@]} == 0 )); then echo "  (none)"; else printf '  %s\n' "${DEV_LABEL[@]}"; fi
+  load_android physical
+  print_section Running
   load_startable
-  bold Stopped; echo
-  if (( ${#DEV_ID[@]} == 0 )); then echo "  (none)"; else printf '  %s\n' "${DEV_LABEL[@]}"; fi
+  print_section Stopped
+}
+
+# ---------- cast ----------
+
+ensure_scrcpy() {
+  command -v scrcpy >/dev/null && return 0
+  if command -v brew >/dev/null && confirm "phone cast uses scrcpy, which isn't installed. Install it with Homebrew?"; then
+    brew install scrcpy || die "brew install scrcpy failed."
+  else
+    die "phone cast needs scrcpy: https://github.com/Genymobile/scrcpy#get-the-app"
+  fi
+}
+
+iphone_connected() {
+  system_profiler SPUSBDataType SPUSBHostDataType 2>/dev/null | grep -qE '^[[:space:]]+(iPhone|iPad)'
+}
+
+cast_ios() {
+  command -v osascript >/dev/null || die "Mirroring an iPhone needs macOS."
+  osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'new movie recording' -e 'end tell' >/dev/null ||
+    die "Couldn't open QuickTime Player."
+  ok "Opened QuickTime Player"
+  info "Click the ⌄ next to the record button and choose your iPhone as the camera."
+}
+
+cmd_cast() {
+  local name="" wireless=0 record=0 file="" filter=physical ios=0
+  local scrcpy_args=() extra=()
+  while (( $# )); do
+    case "$1" in
+      -w|--wireless) wireless=1 ;;
+      -r|--record)
+        record=1
+        if [[ -n "${2:-}" && "$2" != -* && ( "$2" == *.mp4 || "$2" == *.mkv ) ]]; then file="$2"; shift; fi ;;
+      --off)       scrcpy_args+=(--turn-screen-off) ;;
+      --awake)     scrcpy_args+=(--stay-awake) ;;
+      --view-only) scrcpy_args+=(--no-control) ;;
+      -m|--max-size)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--max-size needs a number of pixels, e.g. -m 1024"
+        scrcpy_args+=(--max-size="$2"); shift ;;
+      --emulators) filter=all ;;
+      --ios)       ios=1 ;;
+      --) shift; extra=("$@"); break ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown option: $1 (pass scrcpy options after --)" ;;
+      *) [[ -n "$name" ]] && die "Unexpected argument: $1"; name="$1" ;;
+    esac
+    shift
+  done
+
+  if (( ios == 1 )); then cast_ios; return; fi
+
+  require_adb
+  reset_devices
+  load_android "$filter"
+  if (( $(device_count) == 0 )); then
+    if "$ADB" devices 2>/dev/null | grep -q $'\tunauthorized'; then
+      die "Your phone is connected but unauthorized. Unlock it and accept the 'Allow USB debugging' prompt."
+    fi
+    if iphone_connected; then
+      info "Found an iPhone. scrcpy only supports Android, so opening QuickTime instead."
+      cast_ios; return
+    fi
+    die "No Android phone found. Plug it in with USB debugging enabled (or use --emulators)."
+  fi
+  select_device "$name" "Which device do you want to cast?"
+  ensure_scrcpy
+
+  local args=(--serial="$P_ID" --window-title="$P_NAME")
+  (( wireless == 1 )) && args+=(--tcpip)
+  if (( record == 1 )); then
+    [[ -z "$file" ]] && file="$HOME/Desktop/${P_NAME// /_}-$(date +%Y%m%d-%H%M%S).mp4"
+    file="${file/#\~/$HOME}"
+    args+=(--record="$file")
+  fi
+
+  launch_detached "cast-${P_ID//[:\/]/_}" env ADB="$ADB" scrcpy "${args[@]}" \
+    ${scrcpy_args[@]+"${scrcpy_args[@]}"} ${extra[@]+"${extra[@]}"}
+  ok "Casting $P_NAME — close the window to stop"
+  (( wireless == 1 )) && info "Switching to Wi-Fi; you can unplug the cable once the window is up."
+  (( record == 1 )) && info "Recording to $file"
+  return 0
 }
 
 # ---------- create ----------
 
-ask() {
-  local prompt="$1" default="$2" answer
-  printf '%s [%s]: ' "$prompt" "$default" >&2
-  read -r answer </dev/tty || exit 1
-  echo "${answer:-$default}"
+java_major() {
+  local java="java"
+  [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]] && java="$JAVA_HOME/bin/java"
+  command -v "$java" >/dev/null || { echo 0; return; }
+  "$java" -version 2>&1 | awk -F'"' '/version/ { split($2, v, "."); print (v[1] == "1") ? v[2] : v[1]; exit }'
 }
 
+# avdmanager needs JDK 17+; fall back to Android Studio's bundled JDK only when needed.
 avdmanager() {
-  [[ -x "$AVDMANAGER" ]] || die "avdmanager not found. Install 'Android SDK Command-line Tools' from Android Studio."
-  if [[ -d "$STUDIO_JDK" ]]; then
+  [[ -x "$AVDMANAGER" ]] || die "avdmanager not found. Install 'Android SDK Command-line Tools' from Android Studio's SDK Manager."
+  if (( $(java_major) < 17 )) && [[ -d "$STUDIO_JDK" ]]; then
     JAVA_HOME="$STUDIO_JDK" "$AVDMANAGER" "$@"
   else
     "$AVDMANAGER" "$@"
   fi
 }
 
+host_abis() {
+  case "$(uname -m)" in
+    arm64|aarch64) echo "arm64-v8a" ;;
+    *) echo "x86_64 x86" ;;
+  esac
+}
+
+ask_avd_name() {
+  local default="$1" name existing
+  existing=$("$EMULATOR" -list-avds 2>/dev/null)
+  while true; do
+    name=$(ask "Name" "$default")
+    name="${name// /_}"
+    if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      warn "Use only letters, numbers, '.', '_' and '-'."
+    elif grep -qxF "$name" <<<"$existing"; then
+      warn "An emulator called '$name' already exists."
+    else
+      echo "$name"; return
+    fi
+  done
+}
+
 create_android() {
   # Installed system images, e.g. system-images;android-33;google_apis_playstore;arm64-v8a
-  local images=() dir
+  local images=() dir abis
+  abis=" $(host_abis) "
   for dir in "$SDK"/system-images/*/*/*/; do
     [[ -d "$dir" ]] || continue
     dir="${dir%/}"
+    [[ "$abis" == *" $(basename "$dir") "* ]] || continue
     dir="${dir#"$SDK"/}"
     images+=("${dir//\//;}")
   done
-  (( ${#images[@]} == 0 )) && die "No system images installed. Download one from Android Studio's SDK Manager."
+  (( ${#images[@]} == 0 )) && die "No system images for this Mac's CPU are installed. Download one from Android Studio's SDK Manager."
 
   pick "Which system image?" "${images[@]}"
   local image="${images[$PICKED]}"
 
   local all_profiles profiles=() p
   all_profiles=$(avdmanager list device -c 2>/dev/null | grep -v 'integer expression')
+  [[ -z "$all_profiles" ]] && die "Couldn't load device profiles from avdmanager."
   for p in pixel_9_pro pixel_9 pixel_8 pixel_7 pixel_5 medium_phone small_phone pixel_tablet medium_tablet; do
     grep -qxF "$p" <<<"$all_profiles" && profiles+=("$p")
   done
-  (( ${#profiles[@]} == 0 )) && die "Couldn't load device profiles from avdmanager."
+  profiles+=("More…")
 
   pick "Which device profile?" "${profiles[@]}"
   local profile="${profiles[$PICKED]}"
+  if [[ "$profile" == "More…" ]]; then
+    local everything=()
+    while read -r p; do [[ -n "$p" ]] && everything+=("$p"); done <<<"$all_profiles"
+    pick "Which device profile?" "${everything[@]}"
+    profile="${everything[$PICKED]}"
+  fi
 
   local api="${image#*;}"; api="${api%%;*}"
   local name
-  name=$(ask "Name" "${profile}_${api//-/_}")
-  name="${name// /_}"
+  name=$(ask_avd_name "${profile// /_}_${api//-/_}")
 
   info "Creating $name ($profile, $image)"
-  echo no | avdmanager create avd -n "$name" -k "$image" -d "$profile" >/dev/null ||
-    die "avdmanager failed."
+  local out
+  if ! out=$(echo no | avdmanager create avd -n "$name" -k "$image" -d "$profile" 2>&1); then
+    grep -v 'integer expression' <<<"$out" >&2
+    die "avdmanager couldn't create the emulator."
+  fi
   ok "Created $name — start it with: phone start $name"
 }
 
@@ -397,6 +691,8 @@ for r in json.load(sys.stdin)["runtimes"]:
 }
 
 cmd_create() {
+  [[ "${1:-}" == -h || "${1:-}" == --help ]] && { usage; exit 0; }
+  has_tty || die "phone create is interactive; run it in a terminal."
   pick "Which platform?" "Android" "iOS"
   case "$PICKED" in
     0) create_android ;;
@@ -407,13 +703,14 @@ cmd_create() {
 # ---------- main ----------
 
 case "${1:-}" in
-  start)            shift; cmd_start "$@" ;;
-  stop)             shift; cmd_stop ;;
-  restart)          shift; cmd_restart "$@" ;;
-  create)           shift; cmd_create ;;
-  install)          shift; cmd_install "$@" ;;
-  list|ls)          cmd_list ;;
-  -v|--version)     echo "phone $VERSION" ;;
+  start)             shift; cmd_start "$@" ;;
+  stop)              shift; cmd_stop "$@" ;;
+  restart)           shift; cmd_restart "$@" ;;
+  create)            shift; cmd_create "$@" ;;
+  install)           shift; cmd_install "$@" ;;
+  cast)              shift; cmd_cast "$@" ;;
+  list|ls)           cmd_list ;;
+  -v|--version)      echo "phone $VERSION" ;;
   ""|-h|--help|help) usage ;;
-  *)                warn "Unknown command: $1"; usage; exit 1 ;;
+  *)                 warn "Unknown command: $1"; usage >&2; exit 1 ;;
 esac
