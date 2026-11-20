@@ -22,6 +22,12 @@ Choose [1-2]: 1
 ✓ Starting pixel_8_api_34
 ✓ pixel_8_api_34 is ready (21s)
 
+$ phone run "iphone 17"
+✓ Booting simulator
+✓ Simulator is ready
+› Using env/dev.json
+› flutter run -d 8AFA67F3-… --dart-define-from-file=env/dev.json
+
 $ phone install build/app/outputs/flutter-apk/app-debug.apk
 › Installing app-debug.apk on 🤖 pixel_8_api_34  [emulator-5554]
 ✓ Installed
@@ -52,6 +58,8 @@ $ phone cast --wireless --record
 - **Android and iOS in one list:** emulators and simulators are picked from the same menu.
 - **Picks for you when it can:** if only one device fits, it acts without asking. With several, you get a numbered menu, or you pass part of a name.
 - **Boot-aware:** `--wait` returns only once the device has finished booting, so `phone start -w && flutter run` just works.
+- **One-step app runs:** `phone run` boots a device if needed, waits for it, and hands off to `flutter run`, picking up `env/dev.json` automatically.
+- **Appearance testing:** `phone dark` and `phone font-scale` switch dark mode and system text size on Android and iOS with one command.
 - **Screen mirroring:** `phone cast` mirrors real Android phones over USB or Wi-Fi, with optional recording, powered by [scrcpy](https://github.com/Genymobile/scrcpy).
 - **Guided creation:** `phone create` walks you through system images, device profiles and iOS runtimes, and checks names before creating anything.
 - **Survives your terminal:** emulators and mirrors run detached, so closing the tab doesn't kill them.
@@ -92,6 +100,9 @@ cd phone
 phone list                  # what's running, what's not
 phone start                 # pick a device to boot
 phone start -w "Pixel"      # boot the device whose name contains "Pixel", wait until ready
+phone run "pixel"           # boot if needed, then flutter run on it
+phone dark                  # toggle dark mode on the running device
+phone font-scale 1.3        # bigger system text; `reset` to go back
 phone install app.apk       # install on the running emulator or connected phone
 phone cast                  # mirror your Android phone
 phone stop --all            # shut everything down
@@ -132,6 +143,31 @@ Interactive wizard for a new device:
 ### `phone install <file.apk> [name]`
 
 Installs (or updates, keeping data) an APK on a running emulator or a USB-connected Android phone.
+
+### `phone run [name] [options] [-- flutter args]`
+
+Runs your Flutter app on a device, booting it first when needed. A running device is preferred; otherwise
+`phone` boots the one you pick and waits until it's ready, then `exec`s `flutter run -d <id>`, so hot reload works as usual.
+
+| Option | Description |
+|---|---|
+| `-c`, `--cold` | Cold boot the device if it has to be started (Android). |
+| `--no-env` | Don't add `--dart-define-from-file=env/dev.json` (added automatically when the file exists and you didn't pass one). |
+| `-- <args>` | Pass everything after `--` to `flutter run`, e.g. `phone run -- --release`. |
+
+Run it from the project root (where `pubspec.yaml` is).
+
+### `phone dark [on|off] [name]`
+
+Turns dark mode on or off on a running emulator, phone or simulator. With no `on`/`off`, it toggles.
+
+### `phone font-scale <factor|reset> [name]`
+
+Sets the system text size, which is handy for checking that layouts survive large text.
+
+- **Android:** sets `font_scale` to the exact factor (0.5–3).
+- **iOS:** picks the nearest Dynamic Type size, e.g. `1.3` → `extra-extra-extra-large`, `2` → `accessibility-extra-large`.
+- `reset` goes back to the default (1.0 / `large`).
 
 ### `phone cast [name] [options]`
 
@@ -198,6 +234,8 @@ Android-only use on Linux is expected to work but isn't tested yet.
 | Discover | `emulator -list-avds`, `adb devices` | `xcrun simctl list` |
 | Start / stop | `emulator -avd`, `adb emu kill` | `simctl boot` / `shutdown` |
 | Wait for boot | `getprop sys.boot_completed` | `simctl bootstatus` |
+| Dark mode | `cmd uimode night` | `simctl ui appearance` |
+| Text size | `settings put system font_scale` | `simctl ui content_size` |
 | Create | `avdmanager create avd` | `simctl create` |
 | Mirror | `scrcpy` | QuickTime Player |
 
@@ -215,7 +253,7 @@ Issues and pull requests are welcome. The whole tool is [`bin/phone`](bin/phone)
 - Homebrew tap: `brew install amrahmed242/tap/phone`
 - `phone open <url>`: deep links on the running device
 - `phone push <payload.json>`: simulated iOS push notifications
-- `phone locale` / `phone dark`: switch language and appearance
+- `phone locale` / `phone rtl`: switch language and layout direction
 - `phone screenshot` / `phone record`: capture from emulators and simulators
 - `phone logs`, `phone wipe`, `phone delete`
 - iOS `.app` installs, shell completions, `fzf` picker

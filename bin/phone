@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 default_sdk() {
   if [[ -d "$HOME/Library/Android/sdk" ]]; then echo "$HOME/Library/Android/sdk"
@@ -62,13 +62,20 @@ $(bold COMMANDS)
   restart [name] [-c] [-w]     Restart a running emulator/simulator
   create                       Create a new Android emulator or iOS simulator
   install <file.apk> [name]    Install an APK on a running emulator or connected phone
+  run     [name] [-c]          Boot a device if needed, then flutter run on it
   cast    [name] [options]     Mirror a real device's screen (Android via scrcpy)
+  dark    [on|off] [name]      Toggle or set dark mode on a running device
+  font-scale <x|reset> [name]  Set the system text size, e.g. 1.3
   list                         Show running and stopped devices
 
 $(bold OPTIONS)
   -c, --cold                   Cold boot, skipping the snapshot (Android)
   -w, --wait                   Return only once the device has finished booting
   -a, --all                    Stop every running device
+
+$(bold RUN OPTIONS)
+      --no-env                 Don't add --dart-define-from-file=env/dev.json
+  --  <args>                   Pass the remaining arguments to flutter run
 
 $(bold CAST OPTIONS)
   -w, --wireless               Switch to Wi-Fi so the cable can be unplugged
@@ -304,6 +311,7 @@ wait_android_boot() {
     if [[ -n "$serial" ]]; then
       booted=$("$ADB" -s "$serial" shell getprop sys.boot_completed </dev/null 2>/dev/null | tr -d '\r')
       if [[ "$booted" == 1 ]]; then
+        BOOTED_SERIAL="$serial"
         progress_done
         ok "$avd is ready ($((SECONDS - start))s)"
         return 0
@@ -482,6 +490,150 @@ cmd_list() {
   print_section Running
   load_startable
   print_section Stopped
+}
+
+# ---------- run ----------
+
+# Running devices a command can act on: emulators, phones and booted simulators.
+load_targets() {
+  reset_devices
+  load_android all
+  load_ios Booted
+}
+
+cmd_run() {
+  local name="" cold=0 env_file=1 args=()
+  while (( $# )); do
+    case "$1" in
+      -c|--cold) cold=1 ;;
+      --no-env) env_file=0 ;;
+      --) shift; args=("$@"); break ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown option: $1 (pass flutter options after --)" ;;
+      *) [[ -n "$name" ]] && die "Unexpected argument: $1"; name="$1" ;;
+    esac
+    shift
+  done
+  command -v flutter >/dev/null || die "flutter isn't on your PATH."
+  [[ -f pubspec.yaml ]] || die "No pubspec.yaml here; run this from your Flutter project."
+
+  # Prefer a device that's already up; otherwise boot one and wait for it.
+  load_targets
+  local id=""
+  if [[ -n "$name" ]] && match_device "$name"; then
+    id="$P_ID"
+  elif [[ -z "$name" ]] && (( $(device_count) > 0 )); then
+    select_device "" "Several devices are running. Run on which one?"
+    id="$P_ID"
+  else
+    load_startable
+    (( $(device_count) == 0 )) && die "No devices to run on. Try: phone create"
+    select_device "$name" "Which device should the app run on?"
+    start_device "$P_PLATFORM" "$P_ID" "$cold" 1
+    if [[ "$P_PLATFORM" == android ]]; then id="$BOOTED_SERIAL"; else id="$P_ID"; fi
+  fi
+
+  # Pick up the project's dev env unless one was passed or --no-env is set.
+  if (( env_file == 1 )) && [[ -f env/dev.json ]] && ! grep -q -- '--dart-define-from-file' <<<"${args[*]-}"; then
+    args+=(--dart-define-from-file=env/dev.json)
+    info "Using env/dev.json"
+  fi
+
+  info "flutter run -d $id ${args[*]-}"
+  exec flutter run -d "$id" ${args[@]+"${args[@]}"}
+}
+
+# ---------- appearance ----------
+
+android_is_dark() {
+  "$ADB" -s "$1" shell cmd uimode night </dev/null 2>/dev/null | grep -qi 'yes'
+}
+
+ios_is_dark() {
+  [[ "$(xcrun simctl ui "$1" appearance 2>/dev/null)" == dark ]]
+}
+
+cmd_dark() {
+  local mode="" name=""
+  while (( $# )); do
+    case "$1" in
+      on|off) mode="$1" ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown option: $1" ;;
+      *) [[ -n "$name" ]] && die "Unexpected argument: $1"; name="$1" ;;
+    esac
+    shift
+  done
+
+  load_targets
+  (( $(device_count) == 0 )) && die "No running device. Use: phone start"
+  select_device "$name" "Several devices are running. Change which one?"
+
+  if [[ -z "$mode" ]]; then
+    local dark=1
+    if [[ "$P_PLATFORM" == android ]]; then android_is_dark "$P_ID" || dark=0
+    else ios_is_dark "$P_ID" || dark=0; fi
+    if (( dark == 1 )); then mode=off; else mode=on; fi
+  fi
+
+  if [[ "$P_PLATFORM" == android ]]; then
+    local night=no; [[ "$mode" == on ]] && night=yes
+    "$ADB" -s "$P_ID" shell cmd uimode night "$night" </dev/null >/dev/null || die "Couldn't change dark mode."
+  else
+    local look=light; [[ "$mode" == on ]] && look=dark
+    xcrun simctl ui "$P_ID" appearance "$look" || die "Couldn't change dark mode."
+  fi
+  ok "Dark mode $mode — $P_LABEL"
+}
+
+# Maps a scale factor to the nearest iOS Dynamic Type size.
+ios_content_size() {
+  awk -v s="$1" 'BEGIN {
+    if      (s <= 0.82) print "extra-small"
+    else if (s <= 0.90) print "small"
+    else if (s <= 0.97) print "medium"
+    else if (s <= 1.05) print "large"
+    else if (s <= 1.15) print "extra-large"
+    else if (s <= 1.25) print "extra-extra-large"
+    else if (s <= 1.40) print "extra-extra-extra-large"
+    else if (s <= 1.60) print "accessibility-medium"
+    else if (s <= 1.85) print "accessibility-large"
+    else if (s <= 2.10) print "accessibility-extra-large"
+    else if (s <= 2.50) print "accessibility-extra-extra-large"
+    else                print "accessibility-extra-extra-extra-large"
+  }'
+}
+
+cmd_font_scale() {
+  local scale="" name=""
+  while (( $# )); do
+    case "$1" in
+      reset) scale=1 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown option: $1" ;;
+      *)
+        if [[ -z "$scale" && "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then scale="$1"
+        elif [[ -z "$name" ]]; then name="$1"
+        else die "Unexpected argument: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -z "$scale" ]] && die "Usage: phone font-scale <factor|reset> [device]   e.g. phone font-scale 1.3"
+  awk -v s="$scale" 'BEGIN { exit !(s >= 0.5 && s <= 3) }' || die "Pick a factor between 0.5 and 3."
+
+  load_targets
+  (( $(device_count) == 0 )) && die "No running device. Use: phone start"
+  select_device "$name" "Several devices are running. Change which one?"
+
+  if [[ "$P_PLATFORM" == android ]]; then
+    "$ADB" -s "$P_ID" shell settings put system font_scale "$scale" </dev/null || die "Couldn't change the font scale."
+    ok "Font scale $scale — $P_LABEL"
+  else
+    local size
+    size=$(ios_content_size "$scale")
+    xcrun simctl ui "$P_ID" content_size "$size" || die "Couldn't change the text size."
+    ok "Text size $size (≈ $scale) — $P_LABEL"
+  fi
 }
 
 # ---------- cast ----------
@@ -711,6 +863,9 @@ case "${1:-}" in
   create)            shift; cmd_create "$@" ;;
   install)           shift; cmd_install "$@" ;;
   cast)              shift; cmd_cast "$@" ;;
+  run)               shift; cmd_run "$@" ;;
+  dark)              shift; cmd_dark "$@" ;;
+  font-scale|font)   shift; cmd_font_scale "$@" ;;
   list|ls)           cmd_list ;;
   -v|--version)      echo "phone $VERSION" ;;
   ""|-h|--help|help) usage ;;

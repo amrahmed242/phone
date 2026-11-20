@@ -3,6 +3,13 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-11-20
+
+### Added
+- `phone run`: boots a device when needed, waits for it, then runs `flutter run -d <id>`. Adds `--dart-define-from-file=env/dev.json` automatically when present (`--no-env` to skip); `--` passes flags to flutter.
+- `phone dark [on|off]`: toggle or set dark mode on Android and iOS.
+- `phone font-scale <factor|reset>`: set the system text size; iOS maps the factor to the nearest Dynamic Type size.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added
@@ -32,5 +39,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `start`, `stop`, `restart`, `create`, `install` and `list` for Android emulators and iOS simulators.
 - Install script, MIT license, shellcheck CI.
 
+[0.3.0]: https://github.com/amrahmed242/phone/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/amrahmed242/phone/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/amrahmed242/phone/releases/tag/v0.1.0
